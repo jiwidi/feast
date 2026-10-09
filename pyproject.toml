@@ -101,8 +101,8 @@ image = [
     "scikit-learn>=1.0.0",
 ]
 milvus = [
-    "pymilvus>=2.5",
-    "milvus-lite>=2.4.12",
+    "pymilvus>=3.0.2",
+    "milvus-lite>=3.2.1",
     "feast[setuptools]"
 ]
 mongodb = [
@@ -335,6 +335,18 @@ conflicts = [
     [
         { extra = "flink" },
         { extra = "docs" },
+    ],
+    [
+        { extra = "flink" },
+        { extra = "milvus" },
+    ],
+    [
+        { extra = "flink" },
+        { extra = "minimal" },
+    ],
+    [
+        { extra = "flink" },
+        { extra = "nlp" },
     ],
 ]
 

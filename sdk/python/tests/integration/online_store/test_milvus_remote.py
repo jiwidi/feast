@@ -303,9 +303,7 @@ def test_autoindex_with_search_level(
     _write_rows(store, config, fv, _vector_rows())
 
     assert store.client is not None
-    index = store.client.describe_index(
-        f"{project}_{fv.name}", "vector_index_embedding"
-    )
+    index = store.client.describe_index(f"{project}_{fv.name}", "index_embedding")
     assert index["index_type"] == "AUTOINDEX"
 
     hits = _eventually(
