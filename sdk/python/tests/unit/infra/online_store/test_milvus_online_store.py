@@ -1,16 +1,19 @@
 """Unit tests for the Milvus online store, run against Milvus Lite or a mocked client."""
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
 import pytest
 from pydantic import ValidationError
 from pymilvus import DataType, MilvusClient
 from pymilvus.client.types import LoadState
 
-from feast import Entity, FeatureView
+from feast import Entity, FeatureStore, FeatureView, FileSource, PushSource
+from feast.feature_view import DUMMY_ENTITY_ID, DUMMY_ENTITY_VAL
 from feast.field import Field
 from feast.filter_models import ComparisonFilter
 from feast.infra.online_stores.milvus_online_store.milvus import (
@@ -22,7 +25,7 @@ from feast.infra.online_stores.milvus_online_store.milvus import (
 from feast.protos.feast.types.EntityKey_pb2 import EntityKey as EntityKeyProto
 from feast.protos.feast.types.Value_pb2 import Value as ValueProto
 from feast.repo_config import RepoConfig
-from feast.types import Array, Float32, Int64, String
+from feast.types import Array, Bool, Float32, Float64, Int64, Json, String
 from feast.value_type import ValueType
 
 MILVUS_MODULE = "feast.infra.online_stores.milvus_online_store.milvus"
@@ -60,6 +63,31 @@ def _mock_client(mock_client_cls: MagicMock, has_collection: bool) -> MagicMock:
     mock_client_cls.return_value = mock_client
     mock_client.has_collection.return_value = has_collection
     mock_client.prepare_index_params.side_effect = MilvusClient.prepare_index_params
+    mock_client.get_load_state.return_value = {"state": LoadState.Loaded}
+    mock_client.get.return_value = []
+    schema, indexes = MilvusOnlineStore()._build_schema(
+        _mock_config(), _scalar_feature_view()
+    )
+    definitions = {index.to_dict()["index_name"]: index.to_dict() for index in indexes}
+    mock_client.describe_collection.return_value = {
+        "collection_name": "test_milvus_driver_stats",
+        **schema.to_dict(),
+    }
+    mock_client.list_indexes.side_effect = lambda name: list(definitions)
+    mock_client.describe_index.side_effect = lambda name, index: definitions[index]
+
+    def create_collection(*, collection_name, schema, index_params, **kwargs):
+        definitions.clear()
+        definitions.update(
+            {index.to_dict()["index_name"]: index.to_dict() for index in index_params}
+        )
+        mock_client.describe_collection.return_value = {
+            "collection_name": collection_name,
+            **schema.to_dict(),
+            **kwargs,
+        }
+
+    mock_client.create_collection.side_effect = create_collection
     return mock_client
 
 
@@ -160,6 +188,79 @@ def test_scalar_feature_view_round_trip_with_placeholder(tmp_path: Path) -> None
     assert placeholder["params"]["dim"] == PLACEHOLDER_VECTOR_DIM
 
 
+@pytest.mark.parametrize("entityless", [False, True])
+def test_default_feature_store_apply_push_read_native_types(
+    tmp_path: Path, entityless: bool
+) -> None:
+    config = _lite_config(tmp_path)
+    source = PushSource(
+        name="updates",
+        batch_source=FileSource(
+            path=str(tmp_path / "unused.parquet"), timestamp_field="timestamp"
+        ),
+    )
+    fields = [
+        Field(name="amount", dtype=Float64),
+        Field(name="active", dtype=Bool),
+        Field(name="weights", dtype=Array(Float32)),
+        Field(name="metadata", dtype=Json),
+    ]
+    entities = [] if entityless else [_driver_entity()]
+    fv = FeatureView(
+        name="native_values", entities=entities, schema=fields, source=source
+    )
+    store = FeatureStore(config=config)
+    row = {
+        "amount": 12.5,
+        "active": True,
+        "weights": [0.25, 0.5],
+        "metadata": {"region": {"labels": ["red", "123"], "stock": 2}},
+        "timestamp": datetime.now(timezone.utc),
+    }
+    key = {} if entityless else {"driver_id": 1}
+    try:
+        store.apply([*entities, source, fv])
+        store.push(
+            source.name,
+            pd.DataFrame([{**key, **row, "metadata": json.dumps(row["metadata"])}]),
+        )
+        result = store.get_online_features(
+            features=[f"{fv.name}:{field.name}" for field in fields],
+            entity_rows=[{DUMMY_ENTITY_ID: DUMMY_ENTITY_VAL} if entityless else key],
+        ).to_dict()
+        for field in fields:
+            assert result[field.name] == [row[field.name]]
+
+        online = store._get_provider().online_store
+        registered = store.get_feature_view(fv.name)
+        schema = online.ensure_schema(config, registered)
+        types = {field["name"]: field["type"] for field in schema["fields"]}
+        assert types["amount"] == DataType.DOUBLE
+        assert types["active"] == DataType.BOOL
+        assert types["weights"] == DataType.ARRAY
+        assert types["metadata"] == DataType.JSON
+        if entityless:
+            assert (
+                online.online_read(config, registered, [EntityKeyProto()], ["amount"])[
+                    0
+                ][1]["amount"].double_val
+                == 12.5
+            )
+            online.online_delete(config, registered, [EntityKeyProto()])
+            assert online.online_read(
+                config, registered, [EntityKeyProto()], ["amount"]
+            ) == [(None, None)]
+            assert store.get_online_features(
+                features=[f"{fv.name}:amount"],
+                entity_rows=[{DUMMY_ENTITY_ID: DUMMY_ENTITY_VAL}],
+            ).to_dict()["amount"] == [None]
+    finally:
+        online = store._get_provider().online_store
+        if online.client:
+            store.teardown()
+            online.client.close()
+
+
 @patch(f"{MILVUS_MODULE}.MilvusClient")
 def test_placeholder_vector_is_indexed_and_valid(mock_client_cls: MagicMock) -> None:
     mock_client = _mock_client(mock_client_cls, has_collection=False)
@@ -177,7 +278,7 @@ def test_placeholder_vector_is_indexed_and_valid(mock_client_cls: MagicMock) -> 
 
 
 @patch(f"{MILVUS_MODULE}.MilvusClient")
-def test_placeholder_values_are_finite_and_match_collection_dim(
+def test_legacy_placeholder_is_rejected_without_writing(
     mock_client_cls: MagicMock,
 ) -> None:
     mock_client = _mock_client(mock_client_cls, has_collection=True)
@@ -201,39 +302,29 @@ def test_placeholder_values_are_finite_and_match_collection_dim(
 
     store = MilvusOnlineStore()
     config = _mock_config()
-    _write_rows(
-        store,
-        config,
-        _scalar_feature_view(),
-        {
-            1: {
-                "trips_today": ValueProto(float_val=1.0),
-                "city": ValueProto(string_val="Oslo"),
-            }
-        },
-    )
-
-    data = mock_client.upsert.call_args.kwargs["data"]
-    assert data[0][PLACEHOLDER_VECTOR_FIELD] == [0.0]
+    with pytest.raises(ValueError, match="incompatible.*rematerialize"):
+        _write_rows(
+            store,
+            config,
+            _scalar_feature_view(),
+            {
+                1: {
+                    "trips_today": ValueProto(float_val=1.0),
+                    "city": ValueProto(string_val="Oslo"),
+                }
+            },
+        )
+    mock_client.upsert.assert_not_called()
+    mock_client.delete.assert_not_called()
+    mock_client.drop_collection.assert_not_called()
+    mock_client.create_collection.assert_not_called()
 
 
 def _existing_collection_description() -> Dict[str, Any]:
-    return {
-        "collection_name": "test_milvus_driver_stats",
-        "fields": [
-            {"name": "driver_id_pk", "type": DataType.VARCHAR, "params": {}},
-            {"name": "driver_id", "type": DataType.VARCHAR, "params": {}},
-            {"name": "event_ts", "type": DataType.INT64, "params": {}},
-            {"name": "created_ts", "type": DataType.INT64, "params": {}},
-            {"name": "trips_today", "type": DataType.VARCHAR, "params": {}},
-            {"name": "city", "type": DataType.VARCHAR, "params": {}},
-            {
-                "name": PLACEHOLDER_VECTOR_FIELD,
-                "type": DataType.FLOAT_VECTOR,
-                "params": {"dim": PLACEHOLDER_VECTOR_DIM},
-            },
-        ],
-    }
+    schema, _ = MilvusOnlineStore()._build_schema(
+        _mock_config(), _scalar_feature_view()
+    )
+    return {"collection_name": "test_milvus_driver_stats", **schema.to_dict()}
 
 
 @pytest.mark.parametrize(
@@ -256,7 +347,7 @@ def test_existing_collection_is_loaded_at_most_once(
         store.online_read(config, fv, [_entity_key(1)], ["city"])
 
     assert mock_client.load_collection.call_count == expected_loads
-    assert mock_client.query.call_count == 5
+    assert mock_client.get.call_count == 5
 
 
 @patch(f"{MILVUS_MODULE}.MilvusClient")
@@ -461,7 +552,7 @@ def test_autoindex_gets_no_index_or_search_params_by_default() -> None:
     assert result["index"] == {
         "field_name": "embedding",
         "index_type": "AUTOINDEX",
-        "index_name": "vector_index_embedding",
+        "index_name": "index_embedding",
         "metric_type": "COSINE",
     }
     assert result["search"]["search_params"]["params"] == {}
@@ -538,7 +629,8 @@ def _consistency_calls(
         ]
         read_calls = [
             call.kwargs
-            for call in mock_client.query.call_args_list
+            for call in mock_client.get.call_args_list
+            + mock_client.query.call_args_list
             + mock_client.search.call_args_list
         ]
         return create_calls, read_calls
@@ -710,9 +802,9 @@ def test_feature_view_tag_overrides_store_partition_key(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "online_store, partition_key, error",
     [
-        ({}, "missing_field", "is not a field"),
+        ({}, "missing_field", "not in the feature view"),
         # Native numeric storage makes price a FLOAT, which can't be a partition key.
-        ({"enable_openai_compatible_store": True}, "price", "must be INT64 or VARCHAR"),
+        ({}, "price", "must be String or Int64"),
     ],
 )
 @patch(f"{MILVUS_MODULE}.MilvusClient")
@@ -731,7 +823,7 @@ def test_invalid_partition_key(
 
 
 @patch(f"{MILVUS_MODULE}.MilvusClient")
-def test_warns_when_existing_collection_lacks_partition_key(
+def test_rejects_existing_collection_without_declared_partition_key(
     mock_client_cls: MagicMock, caplog: pytest.LogCaptureFixture
 ) -> None:
     mock_client = _mock_client(mock_client_cls, has_collection=True)
@@ -742,7 +834,10 @@ def test_warns_when_existing_collection_lacks_partition_key(
     }
     fv = _catalog_feature_view({"milvus.partition_key": "brand_id"})
 
-    MilvusOnlineStore()._get_or_create_collection(_mock_config(), fv)
+    with pytest.raises(ValueError, match="incompatible.*rematerialize"):
+        MilvusOnlineStore()._get_or_create_collection(_mock_config(), fv)
 
-    assert "created without partition key 'brand_id'" in caplog.text
+    mock_client.upsert.assert_not_called()
+    mock_client.delete.assert_not_called()
+    mock_client.drop_collection.assert_not_called()
     mock_client.create_collection.assert_not_called()
