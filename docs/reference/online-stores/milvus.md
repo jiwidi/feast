@@ -100,6 +100,11 @@ online_store:
 | `vector_enabled` | `true` | Enables vector search. |
 | `varchar_max_length` | `65535` | Default `max_length` of VARCHAR fields. Override per field with the `max_length` tag. |
 | `enable_openai_compatible_store` | `false` | Store numeric features as native Milvus numeric types. |
+| `storage_format` | `legacy` | `legacy` or `native`. See [Native storage format](#native-storage-format). |
+| `num_partitions` | unset | Native only. Number of partitions for a new collection with a partition key. When unset, Milvus uses its default. |
+| `partition_key_isolation` | unset | Native only. Enables partition-key isolation on a new collection with a partition key. When unset, Milvus uses its default. |
+| `retry_mutations` | `true` | Native only. Set to `false` to disable SDK retries of upserts and deletes. See [Row deletion and mutation control](#row-deletion-and-mutation-control). |
+| `mutation_timeout` | unset | Native only. SDK timeout in seconds for upserts and deletes. Must be unset when `retry_mutations` is `false`. |
 
 The full set of configuration options is available in [MilvusOnlineStoreConfig](https://rtd.feast.dev/en/latest/#feast.infra.online_stores.milvus.MilvusOnlineStoreConfig).
 
@@ -202,6 +207,143 @@ the next time a Feast process first accesses it.
 Milvus requires every collection to have a vector field. For feature views that have no vector
 feature, Feast adds a 2-dimensional `_placeholder_vector` field with a FLAT index and fills it with zeros.
 It is never returned or searched.
+
+## Native storage format
+
+Set `storage_format: native` to store each feature with a native Milvus type. The
+default, `legacy`, does not change.
+
+```yaml
+online_store:
+  type: milvus
+  storage_format: native
+  uri: http://localhost:19530
+  index_type: AUTOINDEX
+  partition_key: tenant_id
+  num_partitions: 16
+  consistency_level: Strong
+```
+
+The native format has these properties:
+
+* Scalars, JSON and arrays keep their types. You can filter on them with Milvus expressions.
+* Only fields with `vector_index=True` become dense vectors.
+* Field tags declare BM25 functions, text analyzers and scalar indexes. Feast creates them with the collection.
+* Feast validates an existing collection before it uses it. An incompatible collection causes an error. Feast does not change or drop it.
+* `online_delete` deletes rows by entity key or by filter.
+
+### Field types
+
+| Feast field | Milvus field |
+| --- | --- |
+| String, Bool, Int32, Int64, Float32, Float64 | The same scalar type |
+| Json, Struct, Map | JSON, including nested objects and arrays |
+| Array of scalars | ARRAY with the same element type |
+| Nested arrays, or arrays of structured values | JSON |
+| Float array with `vector_index=True` | FLOAT_VECTOR. The dimension is `Field.vector_length`, or `embedding_dim` if that is unset |
+| Bytes | Base64 VARCHAR. Feast reads decode it |
+| Unix timestamp | INT64 seconds. Feast reads restore the timestamp |
+
+Other Feast types, for example `ScalarMap`, `Set` and `Decimal`, cause a schema
+error. A collection has one VARCHAR primary key: the serialized Feast entity key.
+Each entity column is also stored, so you can filter on it.
+
+Vectors must have the declared dimension and finite float32 values. A COSINE
+vector must not be all zeros. A JSON value must not be a top-level string, must fit
+in 65536 bytes, and its integers must fit in 64 bits. A collection can have at most
+64 fields, including the key, the timestamps and the BM25 outputs. Feast rejects a
+value that is not valid before it writes the batch. It does not truncate values.
+
+When you push a DataFrame, encode nested `Json` values with `json.dumps(...)`.
+Feast reads return the structured value.
+
+### Field tags
+
+All tag values are strings.
+
+| Tag | Meaning |
+| --- | --- |
+| `max_length` | VARCHAR byte limit, also for strings in arrays. The default is `varchar_max_length`. |
+| `milvus.max_capacity` | Maximum number of elements in an ARRAY, up to 4096. The default is 4096. |
+| `milvus.nullable` | `true` or `false`. The default is `true`, but `false` for dense vectors. Entity and partition-key fields cannot be nullable. |
+| `milvus.bm25` | Name of a sparse output field. Feast adds a BM25 function and a SPARSE_INVERTED_INDEX. |
+| `milvus.analyzer_params` | JSON object with the Milvus analyzer parameters. |
+| `milvus.multi_analyzer_params` | JSON object with `by_field` and `analyzers`. `analyzers` must have a `default` entry. Do not use it with `milvus.analyzer_params`. Requires PyMilvus 2.5.8 or newer. |
+| `milvus.enable_match` | `true` enables TEXT_MATCH. Do not use it with `milvus.multi_analyzer_params`. |
+| `milvus.index` | Index type, for example INVERTED, STL_SORT, NGRAM or HNSW. `false` disables a scalar index. |
+| `milvus.index_params` | JSON object with the build parameters of that index. A vector field with `milvus.index` and no `milvus.index_params` gets no build parameters. |
+| `milvus.json_indexes` | JSON list of typed paths, for example `[{"path":["region","price"],"cast_type":"double","index_type":"AUTOINDEX"}]`. |
+
+This example adds two BM25 fields, a substring index and a sort index:
+
+```python
+Field(
+    name="title",
+    dtype=String,
+    tags={
+        "milvus.bm25": "title_sparse",
+        "milvus.analyzer_params": '{"tokenizer":"standard","filter":["lowercase"]}',
+    },
+),
+Field(name="description", dtype=String, tags={"milvus.bm25": "description_sparse"}),
+Field(
+    name="suggestion",
+    dtype=String,
+    tags={"milvus.index": "NGRAM", "milvus.index_params": '{"min_gram":2,"max_gram":3}'},
+),
+Field(name="popularity", dtype=Int32, tags={"milvus.index": "STL_SORT"}),
+```
+
+Milvus calculates the BM25 outputs. They are not Feast features and you do not
+write them. A view with a BM25 field does not need the placeholder vector. To use
+BM25 fields, search with the Milvus client. `retrieve_online_documents_v2` keeps
+its LIKE text search.
+
+### Schema validation
+
+Feast compares an existing collection with the feature view before it uses it. It
+checks field names, types, element types, nullability, the primary and partition
+keys, dimensions, `max_length`, `max_capacity`, analyzers, TEXT_MATCH, BM25
+functions, partition settings and the declared indexes. It does not compare field
+descriptions. It accepts extra server parameters, such as mmap settings, and
+indexes that an operator added. When the feature view changes, Feast validates
+the collection again.
+
+### Migrate to the native format
+
+The native format cannot use a collection that the legacy format created. Feast
+does not convert the data. To migrate without downtime:
+
+1. Keep the current collection and its readers.
+2. Create a feature view with a new name, or a new version if online feature view versioning is enabled.
+3. Set `vector_index=True` on each embedding field. Set `vector_length` if it is different from `embedding_dim`.
+4. Apply the new view with `storage_format: native`, then materialize it.
+5. Make sure that reads and searches are correct. Then move the readers and writers to the new view.
+6. Remove the old collection.
+
+### Row deletion and mutation control
+
+These methods are available only in the native format:
+
+* `collection_name(config, view)` returns the collection name, with the version suffix if there is one.
+* `ensure_schema(config, view)` creates a missing collection, or validates an existing one, and loads it.
+* `prepare_write_batch(config, view, data)` validates and converts write tuples. It does no I/O and does not change `data`.
+* `online_delete(config, view, entity_keys=[...])` deletes rows by entity key.
+* `online_delete(config, view, filters=...)` deletes the rows that a `ComparisonFilter` or `CompoundFilter` selects. An empty filter is an error.
+
+Give exactly one of `entity_keys` and `filters`. An empty key list does nothing.
+Feast does not keep a tombstone, so a later write can create the row again. Within
+one batch, the row with the latest event timestamp wins, then the latest created
+timestamp, then the last row. Feast does not order writes across batches or
+workers.
+
+By default, PyMilvus retries upserts and deletes. `mutation_timeout` sets their
+timeout. Set `retry_mutations: false` if your application handles uncertain
+results itself. This disables all SDK retries, including retries after rate
+limits, and requires `mutation_timeout` to be unset. A call without a timeout can
+wait for a long time. After a transport error or a cancelled process, the result
+on the server is unknown. Make sure that the earlier write is complete before you
+send a conflicting write.
 
 ## Functionality Matrix
 

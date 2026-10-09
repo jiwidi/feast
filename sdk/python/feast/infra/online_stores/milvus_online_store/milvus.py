@@ -1,11 +1,12 @@
 import base64
 import logging
+import math
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
-from pydantic import StrictStr, field_validator
+from pydantic import StrictStr, field_validator, model_validator
 from pymilvus import (
     CollectionSchema,
     DataType,
@@ -29,6 +30,7 @@ from feast.infra.key_encoding_utils import (
     serialize_entity_key,
 )
 from feast.infra.online_stores.helpers import compute_table_id
+from feast.infra.online_stores.milvus_online_store import native
 from feast.infra.online_stores.online_store import OnlineStore
 from feast.infra.online_stores.vector_store import VectorStoreConfig
 from feast.protos.feast.core.Registry_pb2 import Registry as RegistryProto
@@ -247,6 +249,15 @@ class MilvusOnlineStoreConfig(FeastConfigBaseModel, VectorStoreConfig):
     password: Optional[StrictStr] = ""
     enable_openai_compatible_store: Optional[bool] = False
     varchar_max_length: Optional[int] = 65535
+    # "native" stores typed scalars, JSON and ARRAY fields, supports declarative
+    # search indexes and row deletion. It cannot use "legacy" collections.
+    storage_format: Literal["legacy", "native"] = "legacy"
+    # The options below require storage_format "native".
+    num_partitions: Optional[int] = None
+    partition_key_isolation: Optional[bool] = None
+    # False disables SDK retries of upserts and deletes, including rate-limit retries.
+    retry_mutations: bool = True
+    mutation_timeout: Optional[float] = None
 
     @field_validator("varchar_max_length")
     @classmethod
@@ -254,6 +265,27 @@ class MilvusOnlineStoreConfig(FeastConfigBaseModel, VectorStoreConfig):
         if v is not None and not (1 <= v <= 65535):
             raise ValueError(f"varchar_max_length must be between 1 and 65535, got {v}")
         return v
+
+    @model_validator(mode="after")
+    def validate_native_options(self):
+        native_only = {
+            "num_partitions": self.num_partitions is not None,
+            "partition_key_isolation": self.partition_key_isolation is not None,
+            "retry_mutations": not self.retry_mutations,
+            "mutation_timeout": self.mutation_timeout is not None,
+        }
+        used = [name for name, is_set in native_only.items() if is_set]
+        if self.storage_format == "legacy" and used:
+            raise ValueError(f"{', '.join(used)} require storage_format: native")
+        if self.mutation_timeout is not None and (
+            not math.isfinite(self.mutation_timeout) or self.mutation_timeout <= 0
+        ):
+            raise ValueError("mutation_timeout must be finite and positive")
+        if not self.retry_mutations and self.mutation_timeout is not None:
+            raise ValueError("retry_mutations: false requires mutation_timeout: null")
+        if self.num_partitions is not None and not 1 <= self.num_partitions <= 4096:
+            raise ValueError("num_partitions must be between 1 and 4096")
+        return self
 
 
 class MilvusOnlineStore(OnlineStore):
@@ -268,6 +300,8 @@ class MilvusOnlineStore(OnlineStore):
         super().__init__()
         self.client: Optional[MilvusClient] = None
         self._collections: Dict[str, Any] = {}
+        # Validated native schema fingerprints, by collection name.
+        self._schema_contracts: Dict[str, str] = {}
 
     def _get_db_path(self, config: RepoConfig) -> str:
         assert (
@@ -304,9 +338,52 @@ class MilvusOnlineStore(OnlineStore):
                 self.client = MilvusClient(**client_kwargs)
         return self.client
 
+    def collection_name(self, config: RepoConfig, table: FeatureView) -> str:
+        """Return the collection name of a feature view, including any version suffix."""
+        return _table_id(
+            config.project, table, config.registry.enable_online_feature_view_versioning
+        )
+
+    def ensure_schema(self, config: RepoConfig, table: FeatureView) -> Dict[str, Any]:
+        """Create a missing native collection, or validate an existing one, and load it.
+
+        An incompatible existing collection raises an error. It is not changed.
+        """
+        _require_native(config, "ensure_schema")
+        return self._get_or_create_collection(config, table)
+
+    def prepare_write_batch(
+        self,
+        config: RepoConfig,
+        table: FeatureView,
+        data: List[
+            Tuple[EntityKeyProto, Dict[str, ValueProto], datetime, Optional[datetime]]
+        ],
+    ) -> List[Dict[str, Any]]:
+        """Validate and convert a native write batch without I/O."""
+        _require_native(config, "prepare_write_batch")
+        return native.prepare_write_batch(config, table, data)
+
+    def online_delete(
+        self,
+        config: RepoConfig,
+        table: FeatureView,
+        entity_keys: Optional[List[EntityKeyProto]] = None,
+        *,
+        filters: Optional[Union[ComparisonFilter, CompoundFilter]] = None,
+    ) -> None:
+        """Delete rows by entity keys or by a filter. Give exactly one of the two.
+
+        No tombstone is kept: a later write can create the row again.
+        """
+        _require_native(config, "online_delete")
+        native.delete(self, config, table, entity_keys, filters)
+
     def _get_or_create_collection(
         self, config: RepoConfig, table: FeatureView
     ) -> Dict[str, Any]:
+        if _is_native(config):
+            return native.ensure_collection(self, config, table)
         self.client = self._connect(config)
         vector_field_dict = {k.name: k for k in table.schema if k.vector_index}
         collection_name = _table_id(
@@ -473,6 +550,8 @@ class MilvusOnlineStore(OnlineStore):
         ],
         progress: Optional[Callable[[int], Any]],
     ) -> None:
+        if _is_native(config):
+            return native.write_batch(self, config, table, data, progress)
         self.client = self._connect(config)
         collection = self._get_or_create_collection(config, table)
         vector_cols = [f.name for f in table.features if f.vector_index]
@@ -569,6 +648,8 @@ class MilvusOnlineStore(OnlineStore):
         entity_keys: List[EntityKeyProto],
         requested_features: Optional[List[str]] = None,
     ) -> List[Tuple[Optional[datetime], Optional[Dict[str, ValueProto]]]]:
+        if _is_native(config):
+            return native.read(self, config, table, entity_keys, requested_features)
         self.client = self._connect(config)
         collection_name = _table_id(
             config.project, table, config.registry.enable_online_feature_view_versioning
@@ -773,6 +854,18 @@ class MilvusOnlineStore(OnlineStore):
         Returns:
             List of tuples containing the event timestamp, entity key, and feature values
         """
+        if _is_native(config):
+            return native.retrieve_documents(
+                self,
+                config,
+                table,
+                requested_features,
+                embedding,
+                top_k,
+                distance_metric,
+                query_string,
+                filters,
+            )
         entity_name_feast_primitive_type_map = {
             k.name: k.dtype
             for k in list(table.entity_columns) + list(table.features)
@@ -1051,10 +1144,20 @@ class MilvusOnlineStore(OnlineStore):
             ):
                 self.client.drop_collection(collection_name)
                 self._collections.pop(collection_name, None)
+                self._schema_contracts.pop(collection_name, None)
 
 
 def _table_id(project: str, table: FeatureView, enable_versioning: bool = False) -> str:
     return compute_table_id(project, table, enable_versioning)
+
+
+def _is_native(config: RepoConfig) -> bool:
+    return config.online_store.storage_format == "native"
+
+
+def _require_native(config: RepoConfig, method: str) -> None:
+    if not _is_native(config):
+        raise ValueError(f"MilvusOnlineStore.{method} requires storage_format: native")
 
 
 def _is_autoindex(online_config: MilvusOnlineStoreConfig) -> bool:
