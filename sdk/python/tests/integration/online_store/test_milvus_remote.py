@@ -464,3 +464,29 @@ def test_partition_options(
         filters=ComparisonFilter(type="eq", key="brand_id", value="globex"),
     )
     assert [hit["city"].string_val for hit in hits] == ["Rome"]
+
+
+def test_schema_mismatch(
+    tmp_path: Path, project: str, store: MilvusOnlineStore
+) -> None:
+    config = _repo_config(tmp_path, project)
+    store.update(config, [], [_scalar_feature_view()], [], [], partial=False)
+    changed = FeatureView(
+        name="driver_stats",
+        entities=[
+            Entity(
+                name="driver_id", join_keys=["driver_id"], value_type=ValueType.INT64
+            )
+        ],
+        ttl=timedelta(days=1),
+        schema=[
+            Field(name="driver_id", dtype=Int64),
+            Field(name="trips_today", dtype=Float32),
+            Field(name="city", dtype=String),
+            Field(name="country", dtype=String),
+        ],
+    )
+
+    strict = _repo_config(tmp_path, project, fail_on_schema_mismatch=True)
+    with pytest.raises(ValueError, match="field 'country' is not in the collection"):
+        MilvusOnlineStore().update(strict, [], [changed], [], [], partial=False)

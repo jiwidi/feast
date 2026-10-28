@@ -783,3 +783,106 @@ def test_partition_options_not_sent_when_unset(mock_client_cls: MagicMock) -> No
 def test_invalid_num_partitions_rejected() -> None:
     with pytest.raises(ValidationError, match="num_partitions"):
         MilvusOnlineStoreConfig(num_partitions=0)
+
+
+def _mismatched_collection_description() -> Dict[str, Any]:
+    """The scalar collection without ``city``, with ``country`` and a 1-dim placeholder."""
+    description = _existing_collection_description()
+    description["fields"] = [
+        field for field in description["fields"] if field["name"] != "city"
+    ] + [{"name": "country", "type": DataType.VARCHAR, "params": {}}]
+    for field in description["fields"]:
+        if field["name"] == PLACEHOLDER_VECTOR_FIELD:
+            field["params"] = {"dim": 1}
+    return description
+
+
+@patch(f"{MILVUS_MODULE}.MilvusClient")
+def test_schema_mismatch_is_logged_by_default(
+    mock_client_cls: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    mock_client = _mock_client(mock_client_cls, has_collection=True)
+    mock_client.get_load_state.return_value = {"state": LoadState.Loaded}
+    mock_client.describe_collection.return_value = _mismatched_collection_description()
+
+    MilvusOnlineStore()._get_or_create_collection(
+        _mock_config(), _scalar_feature_view()
+    )
+
+    assert "field 'city' is not in the collection" in caplog.text
+    assert "field 'country' is not in the feature view" in caplog.text
+    assert PLACEHOLDER_VECTOR_FIELD not in caplog.text
+    mock_client.create_collection.assert_not_called()
+
+
+@patch(f"{MILVUS_MODULE}.MilvusClient")
+def test_schema_mismatch_raises_when_configured(mock_client_cls: MagicMock) -> None:
+    mock_client = _mock_client(mock_client_cls, has_collection=True)
+    mock_client.get_load_state.return_value = {"state": LoadState.Loaded}
+    mock_client.describe_collection.return_value = _mismatched_collection_description()
+    store = MilvusOnlineStore()
+
+    with pytest.raises(ValueError, match="field 'city' is not in the collection"):
+        store._get_or_create_collection(
+            _mock_config(fail_on_schema_mismatch=True), _scalar_feature_view()
+        )
+
+    assert store._collections == {}
+
+
+@patch(f"{MILVUS_MODULE}.MilvusClient")
+def test_vector_dimension_mismatch_is_reported(mock_client_cls: MagicMock) -> None:
+    mock_client = _mock_client(mock_client_cls, has_collection=True)
+    mock_client.get_load_state.return_value = {"state": LoadState.Loaded}
+    mock_client.describe_collection.return_value = {
+        "collection_name": "test_milvus_driver_embeddings",
+        "fields": [
+            {"name": "driver_id_pk", "type": DataType.VARCHAR, "params": {}},
+            {"name": "event_ts", "type": DataType.INT64, "params": {}},
+            {"name": "created_ts", "type": DataType.INT64, "params": {}},
+            {"name": "driver_id", "type": DataType.VARCHAR, "params": {}},
+            {"name": "embedding", "type": DataType.FLOAT_VECTOR, "params": {"dim": 3}},
+            {"name": "city", "type": DataType.VARCHAR, "params": {}},
+        ],
+    }
+
+    with pytest.raises(ValueError, match="dim 3, the feature view declares dim 2"):
+        MilvusOnlineStore()._get_or_create_collection(
+            _mock_config(embedding_dim=2, fail_on_schema_mismatch=True),
+            _vector_feature_view(),
+        )
+
+
+def test_schema_mismatch_on_an_existing_collection(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    config = _lite_config(tmp_path)
+    store = MilvusOnlineStore()
+    store.update(config, [], [_scalar_feature_view()], [], [], partial=False)
+    changed = FeatureView(
+        name="driver_stats",
+        entities=[_driver_entity()],
+        ttl=timedelta(days=1),
+        schema=[
+            Field(name="driver_id", dtype=Int64),
+            Field(name="trips_today", dtype=Float32),
+            Field(name="city", dtype=String),
+            Field(name="country", dtype=String),
+        ],
+    )
+
+    # A new process checks the collection again.
+    store._collections.clear()
+    store.update(config, [], [changed], [], [], partial=False)
+    assert "field 'country' is not in the collection" in caplog.text
+
+    store._collections.clear()
+    with pytest.raises(ValueError, match="field 'country' is not in the collection"):
+        store.update(
+            _lite_config(tmp_path, fail_on_schema_mismatch=True),
+            [],
+            [changed],
+            [],
+            [],
+            partial=False,
+        )

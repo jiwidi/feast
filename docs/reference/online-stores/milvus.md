@@ -102,6 +102,7 @@ online_store:
 | `vector_enabled` | `true` | Enables vector search. |
 | `varchar_max_length` | `65535` | Default `max_length` of VARCHAR fields. Override per field with the `max_length` tag. |
 | `enable_openai_compatible_store` | `false` | Store numeric features as native Milvus numeric types. |
+| `fail_on_schema_mismatch` | `false` | Raise an error, instead of logging a warning, when an existing collection does not have the fields the feature view declares. See [Schema mismatch](#schema-mismatch). |
 
 The full set of configuration options is available in [MilvusOnlineStoreConfig](https://rtd.feast.dev/en/latest/#feast.infra.online_stores.milvus.MilvusOnlineStoreConfig).
 
@@ -204,6 +205,16 @@ Feast creates collections together with their indexes, which makes Milvus load t
 When Feast finds an existing collection it checks its load state and loads it only if needed.
 Reads and searches never load collections, so a collection released outside Feast is only reloaded
 the next time a Feast process first accesses it.
+
+## Schema mismatch
+
+A collection's schema only applies when Feast creates it. When Feast finds an existing collection
+whose fields differ from the feature view, because a field was added or removed or a vector
+dimension changed, it logs a warning that names each difference and keeps using the collection.
+Set `fail_on_schema_mismatch: true` to raise an error instead, so that a changed feature view is
+caught at `feast apply` before any data is written. To apply the new schema, run `feast teardown`
+and `feast apply`, then materialize again. Field types are not compared: Feast reads and writes a
+collection with the types it has.
 
 ## Feature views without vectors
 

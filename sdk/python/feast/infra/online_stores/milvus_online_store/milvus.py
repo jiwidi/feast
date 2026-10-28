@@ -253,6 +253,9 @@ class MilvusOnlineStoreConfig(FeastConfigBaseModel, VectorStoreConfig):
     password: Optional[StrictStr] = ""
     enable_openai_compatible_store: Optional[bool] = False
     varchar_max_length: Optional[int] = 65535
+    # Raise an error, instead of logging a warning, when an existing collection
+    # does not have the fields the feature view declares.
+    fail_on_schema_mismatch: Optional[bool] = False
 
     @field_validator("num_partitions")
     @classmethod
@@ -455,15 +458,14 @@ class MilvusOnlineStore(OnlineStore):
                 )
             else:
                 self._ensure_loaded(collection_name)
-            # Collections are only cached once loaded, so reads and searches
-            # don't need to load them again.
-            self._collections[collection_name] = self.client.describe_collection(
-                collection_name
-            )
-            if collection_exists and partition_key:
-                _warn_if_partition_key_missing(
-                    self._collections[collection_name], partition_key
-                )
+            description = self.client.describe_collection(collection_name)
+            if collection_exists:
+                _check_schema(config.online_store, schema, description)
+                if partition_key:
+                    _warn_if_partition_key_missing(description, partition_key)
+            # Collections are only cached once loaded and checked, so reads and
+            # searches don't need to load or check them again.
+            self._collections[collection_name] = description
         return self._collections[collection_name]
 
     def _ensure_loaded(self, collection_name: str) -> None:
@@ -1130,6 +1132,61 @@ def _mark_partition_key(
             "INT64 or VARCHAR."
         )
     field.is_partition_key = True
+
+
+def _schema_mismatches(
+    schema: CollectionSchema, collection: Dict[str, Any]
+) -> List[str]:
+    """Fields that differ between a feature view's schema and an existing collection.
+
+    Field types are not compared: reads and writes adapt to the types a collection
+    has, for example numeric fields stored as VARCHAR.
+    """
+    declared = {field.name: field for field in schema.fields}
+    existing = {field["name"]: field for field in collection["fields"]}
+    mismatches = [
+        f"field '{name}' is not in the collection"
+        for name in declared
+        if name not in existing
+    ] + [
+        f"field '{name}' is not in the feature view"
+        for name in existing
+        if name not in declared
+    ]
+    for name in declared:
+        # Older Feast versions created a 1-dim placeholder; writes adapt to it.
+        if name not in existing or name == PLACEHOLDER_VECTOR_FIELD:
+            continue
+        declared_dim = declared[name].params.get("dim")
+        existing_dim = existing[name].get("params", {}).get("dim")
+        if declared_dim is None or existing_dim is None:
+            continue
+        if int(declared_dim) != int(existing_dim):
+            mismatches.append(
+                f"field '{name}' has dim {existing_dim}, "
+                f"the feature view declares dim {declared_dim}"
+            )
+    return mismatches
+
+
+def _check_schema(
+    online_config: MilvusOnlineStoreConfig,
+    schema: CollectionSchema,
+    collection: Dict[str, Any],
+) -> None:
+    """Log, or raise with ``fail_on_schema_mismatch``, the schema differences."""
+    mismatches = _schema_mismatches(schema, collection)
+    if not mismatches:
+        return
+    message = (
+        f"Collection '{collection['collection_name']}' does not match the feature "
+        f"view schema: {'; '.join(mismatches)}. A collection's schema only applies "
+        "when it is created: run `feast teardown` and `feast apply`, then "
+        "materialize again to use the new schema."
+    )
+    if online_config.fail_on_schema_mismatch:
+        raise ValueError(message)
+    logger.warning(message)
 
 
 def _warn_if_partition_key_missing(
