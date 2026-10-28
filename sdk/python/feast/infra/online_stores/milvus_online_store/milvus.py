@@ -1,5 +1,6 @@
 import base64
 import logging
+import math
 import re
 from datetime import datetime
 from pathlib import Path
@@ -247,6 +248,18 @@ class MilvusOnlineStoreConfig(FeastConfigBaseModel, VectorStoreConfig):
     password: Optional[StrictStr] = ""
     enable_openai_compatible_store: Optional[bool] = False
     varchar_max_length: Optional[int] = 65535
+    # Total time in seconds that an upsert or a delete may take, including the
+    # PyMilvus retries. When unset, PyMilvus applies its default retry policy.
+    mutation_timeout: Optional[float] = None
+
+    @field_validator("mutation_timeout")
+    @classmethod
+    def validate_mutation_timeout(cls, v):
+        if v is not None and not (math.isfinite(v) and v > 0):
+            raise ValueError(
+                f"mutation_timeout must be a positive number of seconds, got {v}"
+            )
+        return v
 
     @field_validator("varchar_max_length")
     @classmethod
@@ -560,6 +573,7 @@ class MilvusOnlineStore(OnlineStore):
         self.client.upsert(
             collection_name=collection["collection_name"],
             data=entity_batch_to_insert,
+            **_mutation_kwargs(config.online_store),
         )
 
     def online_read(
@@ -750,7 +764,11 @@ class MilvusOnlineStore(OnlineStore):
         ):
             return
         collection = self._get_or_create_collection(config, table)
-        self.client.delete(collection_name=collection["collection_name"], **selector)
+        self.client.delete(
+            collection_name=collection["collection_name"],
+            **selector,
+            **_mutation_kwargs(config.online_store),
+        )
 
     def update(
         self,
@@ -1101,6 +1119,13 @@ class MilvusOnlineStore(OnlineStore):
 
 def _table_id(project: str, table: FeatureView, enable_versioning: bool = False) -> str:
     return compute_table_id(project, table, enable_versioning)
+
+
+def _mutation_kwargs(online_config: MilvusOnlineStoreConfig) -> Dict[str, Any]:
+    """PyMilvus treats ``timeout`` as the budget of a call and all its retries."""
+    if online_config.mutation_timeout is None:
+        return {}
+    return {"timeout": online_config.mutation_timeout}
 
 
 def _is_autoindex(online_config: MilvusOnlineStoreConfig) -> bool:

@@ -100,6 +100,7 @@ online_store:
 | `vector_enabled` | `true` | Enables vector search. |
 | `varchar_max_length` | `65535` | Default `max_length` of VARCHAR fields. Override per field with the `max_length` tag. |
 | `enable_openai_compatible_store` | `false` | Store numeric features as native Milvus numeric types. |
+| `mutation_timeout` | unset | Total time in seconds that an upsert or a delete may take, including PyMilvus retries. When unset, PyMilvus applies its default retry policy. See [Mutation timeout](#mutation-timeout). |
 
 The full set of configuration options is available in [MilvusOnlineStoreConfig](https://rtd.feast.dev/en/latest/#feast.infra.online_stores.milvus.MilvusOnlineStoreConfig).
 
@@ -216,6 +217,21 @@ Give exactly one of `entity_keys` and `filters`. An empty key list deletes nothi
 with no conditions is rejected, so a mistake cannot empty the collection. A deleted row leaves no
 tombstone: a later write creates it again, and Feast does not order a delete against writes from
 other processes. Deletion works on every collection that Feast created.
+
+## Mutation timeout
+
+PyMilvus retries a failed upsert or delete, and a call without a timeout can wait for a long time,
+for example while a cluster refuses writes because it is at its memory quota. `mutation_timeout`
+bounds the whole call, retries included:
+
+```yaml
+online_store:
+  type: milvus
+  mutation_timeout: 60
+```
+
+After a timeout, the result on the server is unknown: the batch may have been applied in part or in
+full. Upserts and deletes of the same rows are idempotent, so the caller can repeat the call.
 
 ## Feature views without vectors
 

@@ -430,3 +430,20 @@ def test_online_delete(tmp_path: Path, project: str, store: MilvusOnlineStore) -
     _write_rows(store, config, fv, {1: _vector_rows()[1]})
     rows = _read(store, config, fv, [1], ["city"])
     assert rows[0] is not None and rows[0]["city"].string_val == "Paris"
+
+
+def test_mutation_timeout(
+    tmp_path: Path, project: str, store: MilvusOnlineStore
+) -> None:
+    config = _repo_config(
+        tmp_path, project, mutation_timeout=5, consistency_level="Strong"
+    )
+    fv = _vector_feature_view()
+    store.update(config, [], [fv], [], [], partial=False)
+
+    _write_rows(store, config, fv, _vector_rows())
+    rows = _read(store, config, fv, [1, 2], ["city"])
+    assert [row["city"].string_val for row in rows if row] == ["Paris", "Rome"]
+
+    store.online_delete(config, fv, [_entity_key(1), _entity_key(2)])
+    assert _read(store, config, fv, [1, 2], ["city"]) == [None, None]

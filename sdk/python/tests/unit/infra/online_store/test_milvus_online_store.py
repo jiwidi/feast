@@ -826,3 +826,35 @@ def test_online_delete_does_not_create_a_missing_collection(
 
     mock_client.create_collection.assert_not_called()
     mock_client.delete.assert_not_called()
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])
+def test_invalid_mutation_timeout_rejected(timeout: float) -> None:
+    with pytest.raises(ValidationError, match="mutation_timeout"):
+        MilvusOnlineStoreConfig(mutation_timeout=timeout)
+
+
+@pytest.mark.parametrize(
+    "online_store, expected",
+    [({}, {}), ({"mutation_timeout": 5}, {"timeout": 5})],
+)
+def test_mutation_timeout_sent_to_upserts_and_deletes(
+    tmp_path: Path, online_store: Dict[str, Any], expected: Dict[str, Any]
+) -> None:
+    config = _lite_config(tmp_path, **online_store)
+    fv = _scalar_feature_view()
+    store = MilvusOnlineStore()
+    store.update(config, [], [fv], [], [], partial=False)
+    assert store.client is not None
+
+    with (
+        patch.object(store.client, "upsert", wraps=store.client.upsert) as upsert,
+        patch.object(store.client, "delete", wraps=store.client.delete) as delete,
+    ):
+        _write_rows(store, config, fv, {1: {"city": ValueProto(string_val="Paris")}})
+        store.online_delete(config, fv, [_entity_key(1)])
+
+    for call in (upsert.call_args, delete.call_args):
+        sent = {key: call.kwargs[key] for key in expected}
+        assert sent == expected and ("timeout" in call.kwargs) == bool(expected)
+    assert _read(store, config, fv, [1], ["city"]) == [None]
