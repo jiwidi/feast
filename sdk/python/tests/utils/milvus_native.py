@@ -99,6 +99,7 @@ def view(name: str = "documents") -> FeatureView:
                 dtype=String,
                 tags={
                     "milvus.bm25": "summary_sparse",
+                    "milvus.bm25_index_params": '{"bm25_k1":1.2,"bm25_b":0.3}',
                     "milvus.analyzer_params": '{"tokenizer":"standard"}',
                     "milvus.enable_match": "true",
                 },
