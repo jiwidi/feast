@@ -83,6 +83,24 @@ def test_native_schema_types_dimensions_metadata_functions_indexes() -> None:
         index.get("json_path") == 'metadata["arbitrary region"]["price"]'
         for index in definitions
     )
+    by_name = {index["index_name"]: index for index in definitions}
+    assert by_name["index_summary_sparse"]["inverted_index_algo"] == "TAAT_NAIVE"
+    assert by_name["index_summary_sparse"]["bm25_b"] == 0.3
+    assert by_name["index_title_sparse"]["inverted_index_algo"] == "DAAT_MAXSCORE"
+    assert "bm25_b" not in by_name["index_title_sparse"]
+
+
+def test_bm25_index_params_require_bm25() -> None:
+    fv, cfg = view(), config()
+    fv.features.append(
+        Field(
+            name="note",
+            dtype=String,
+            tags={"milvus.bm25_index_params": '{"bm25_b":0.3}'},
+        )
+    )
+    with pytest.raises(ValueError, match="bm25_index_params requires bm25"):
+        collection_schema(cfg, fv)
 
 
 def test_prepare_is_pure_preserves_composite_keys_and_latest_in_batch() -> None:
@@ -215,7 +233,8 @@ def test_default_native_fields_and_mutation_options() -> None:
 
 
 @pytest.mark.parametrize(
-    "change", ["analyzer", "match", "index", "missing_index", "partitions", "isolation"]
+    "change",
+    ["analyzer", "match", "index", "bm25", "missing_index", "partitions", "isolation"],
 )
 def test_native_validates_actual_server_contract(change: str) -> None:
     store, cfg, fv = MilvusOnlineStore(), config(), view()
@@ -232,6 +251,8 @@ def test_native_validates_actual_server_contract(change: str) -> None:
         ]["analyzer_params"] = {"type": "english"}
     elif change == "index":
         by_name["index_suggestion"]["min_gram"] = "4"
+    elif change == "bm25":
+        by_name["index_summary_sparse"]["bm25_b"] = "0.75"
     elif change == "match":
         next(field for field in description["fields"] if field["name"] == "title")[
             "params"
