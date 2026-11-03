@@ -277,6 +277,7 @@ def build_schema(
             )
         output = field.tags.get("milvus.bm25")
         if output:
+            bm25_params = _json_tag(field, "milvus.bm25_index_params", dict, "{}")
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", output):
                 raise ValueError(f"{field.name}: invalid BM25 output identifier")
             schema.add_field(output, DataType.SPARSE_FLOAT_VECTOR)
@@ -293,8 +294,10 @@ def build_schema(
                 index_name=f"index_{output}",
                 index_type="SPARSE_INVERTED_INDEX",
                 metric_type="BM25",
-                params={"inverted_index_algo": "DAAT_MAXSCORE"},
+                params={"inverted_index_algo": "DAAT_MAXSCORE", **bm25_params},
             )
+        elif "milvus.bm25_index_params" in field.tags:
+            raise ValueError(f"{field.name}: bm25_index_params requires bm25")
     if partition_key and partition_key not in fields:
         raise ValueError(f"Partition key {partition_key!r} is not in the feature view")
     if not outputs and not any(field.vector_index for field in fields.values()):

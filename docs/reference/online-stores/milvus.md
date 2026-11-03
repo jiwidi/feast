@@ -267,6 +267,7 @@ All tag values are strings.
 | `milvus.max_capacity` | Maximum number of elements in an ARRAY, up to 4096. The default is 4096. |
 | `milvus.nullable` | `true` or `false`. The default is `true`, but `false` for dense vectors. Entity and partition-key fields cannot be nullable. |
 | `milvus.bm25` | Name of a sparse output field. Feast adds a BM25 function and a SPARSE_INVERTED_INDEX. |
+| `milvus.bm25_index_params` | JSON object with build parameters of the BM25 output index, for example `{"bm25_k1":1.2,"bm25_b":0.75}`. They are merged over the default `{"inverted_index_algo":"DAAT_MAXSCORE"}`. Requires `milvus.bm25`. |
 | `milvus.analyzer_params` | JSON object with the Milvus analyzer parameters. |
 | `milvus.multi_analyzer_params` | JSON object with `by_field` and `analyzers`. `analyzers` must have a `default` entry. Do not use it with `milvus.analyzer_params`. Requires PyMilvus 2.5.8 or newer. |
 | `milvus.enable_match` | `true` enables TEXT_MATCH. Do not use it with `milvus.multi_analyzer_params`. |
