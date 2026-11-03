@@ -276,8 +276,8 @@ def build_schema(
                 },
             )
         output = field.tags.get("milvus.bm25")
-        bm25_params = _json_tag(field, "milvus.bm25_index_params", dict, "{}")
         if output:
+            bm25_params = _json_tag(field, "milvus.bm25_index_params", dict, "{}")
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", output):
                 raise ValueError(f"{field.name}: invalid BM25 output identifier")
             schema.add_field(output, DataType.SPARSE_FLOAT_VECTOR)

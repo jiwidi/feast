@@ -84,8 +84,9 @@ def test_native_schema_types_dimensions_metadata_functions_indexes() -> None:
         for index in definitions
     )
     by_name = {index["index_name"]: index for index in definitions}
+    assert by_name["index_summary_sparse"]["inverted_index_algo"] == "TAAT_NAIVE"
     assert by_name["index_summary_sparse"]["bm25_b"] == 0.3
-    assert by_name["index_summary_sparse"]["inverted_index_algo"] == "DAAT_MAXSCORE"
+    assert by_name["index_title_sparse"]["inverted_index_algo"] == "DAAT_MAXSCORE"
     assert "bm25_b" not in by_name["index_title_sparse"]
 
 
