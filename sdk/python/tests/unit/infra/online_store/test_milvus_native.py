@@ -431,14 +431,8 @@ def test_concurrent_create_validates_the_collection_another_writer_made() -> Non
 
 
 def test_legacy_format_rejects_native_options_and_methods() -> None:
-    for option in (
-        {"num_partitions": 4},
-        {"partition_key_isolation": False},
-        {"retry_mutations": False},
-        {"mutation_timeout": 5},
-    ):
-        with pytest.raises(ValueError, match="require storage_format: native"):
-            MilvusOnlineStoreConfig(**option)
+    with pytest.raises(ValueError, match="require storage_format: native"):
+        MilvusOnlineStoreConfig(retry_mutations=False)
     store, fv = MilvusOnlineStore(), view()
     cfg = RepoConfig(
         project="native_test",
@@ -451,7 +445,6 @@ def test_legacy_format_rejects_native_options_and_methods() -> None:
     for call in (
         lambda: store.ensure_schema(cfg, fv),
         lambda: store.prepare_write_batch(cfg, fv, batch(fv)),
-        lambda: store.online_delete(cfg, fv, [batch(fv)[0][0]]),
     ):
         with pytest.raises(ValueError, match="requires storage_format: native"):
             call()

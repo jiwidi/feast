@@ -307,6 +307,7 @@ class MilvusOnlineStoreConfig(FeastConfigBaseModel, VectorStoreConfig):
         if v is not None and v < 1:
             raise ValueError(f"num_partitions must be at least 1, got {v}")
         return v
+
     # "native" stores typed scalars, JSON and ARRAY fields, supports declarative
     # search indexes and row deletion. It cannot use "legacy" collections.
     storage_format: Literal["legacy", "native"] = "legacy"
